@@ -1,28 +1,26 @@
-import os
 from pathlib import Path
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import xgboost as xgb
-
+import matplotlib.pyplot as plt
 
 # ============================================================
-# 1. 本地模型路径设置
+# 1. Model path and risk thresholds
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-
 MODEL_PATH = BASE_DIR / "XGB_final_model_specOverSensEq1.json"
 
-# 三层风险阈值：来自你保存的 XGB_3level_risk_cutoff_nestedCV.rds
+# Three-level risk thresholds
 T1_LOW_TO_INTERMEDIATE = 0.06623795
 T2_INTERMEDIATE_TO_HIGH = 0.15242195
 
 
 # ============================================================
-# 2. 固定模型输入变量顺序
-#    注意：这里的变量名是模型后台变量名，不能随意修改
+# 2. Fixed model input order
+#    Do not change this order unless the model is retrained.
 # ============================================================
 
 FEATURE_ORDER = [
@@ -50,7 +48,7 @@ FEATURE_ORDER = [
 
 
 # ============================================================
-# 3. 网页显示用英文全称和单位
+# 3. Display labels
 # ============================================================
 
 FEATURE_LABELS = {
@@ -78,16 +76,83 @@ FEATURE_LABELS = {
 
 
 # ============================================================
-# 4. 读取 XGBoost 模型
+# 4. Missing value handling
+# ============================================================
+
+MISSING_TOKENS = {
+    "",
+    "缺失",
+    "无",
+    "无记录",
+    "未检测",
+    "missing",
+    "Missing",
+    "MISSING",
+    "NA",
+    "N/A",
+    "na",
+    "n/a",
+    "NaN",
+    "nan",
+    "None",
+    "none",
+    "-"
+}
+
+
+def parse_numeric_or_missing(value, variable_name):
+    """
+    Convert user input into float or np.nan.
+    Users may enter a numeric value or missing-value tokens such as '缺失', 'missing', or 'NA'.
+    """
+    if value is None:
+        return np.nan
+
+    value = str(value).strip()
+
+    if value in MISSING_TOKENS:
+        return np.nan
+
+    try:
+        return float(value)
+    except ValueError:
+        st.error(
+            f"Invalid input for {variable_name}: '{value}'. "
+            "Please enter a numeric value or 'missing'/'缺失'."
+        )
+        st.stop()
+
+
+def text_numeric_input(label, default_value=""):
+    """
+    Text input that accepts either numeric values or missing-value tokens.
+    """
+    return st.text_input(
+        label,
+        value=default_value,
+        placeholder="Enter a value or missing/缺失"
+    )
+
+
+def format_value_for_display(x):
+    """
+    Display missing values as 'Missing' and numeric values with one decimal place.
+    """
+    if pd.isna(x):
+        return "Missing"
+    return f"{float(x):.1f}"
+
+
+# ============================================================
+# 5. Load XGBoost model
 # ============================================================
 
 @st.cache_resource
 def load_xgb_model(model_path: Path):
     if not model_path.exists():
         raise FileNotFoundError(
-            f"未找到模型文件：{model_path}\n"
-            "请确认 XGB_final_model_specOverSensEq1.json 已经放在 "
-            "/Users/quanmeihui/Desktop/感染预测-半监督 文件夹中。"
+            f"Model file not found: {model_path}\n"
+            "Please make sure XGB_final_model_specOverSensEq1.json is in the same folder as app.py."
         )
 
     booster = xgb.Booster()
@@ -96,7 +161,7 @@ def load_xgb_model(model_path: Path):
 
 
 # ============================================================
-# 5. 风险分层函数
+# 6. Risk stratification functions
 # ============================================================
 
 def classify_risk(probability: float):
@@ -142,7 +207,7 @@ def risk_color_style(risk_group: str):
 
 
 # ============================================================
-# 6. 构建输入数据
+# 7. Build input data and predict
 # ============================================================
 
 def build_input_dataframe(
@@ -167,7 +232,12 @@ def build_input_dataframe(
     lymphocyte_count,
     iga
 ):
-    fever_value = 1 if fever == "Yes" else 0
+    if fever == "Yes":
+        fever_value = 1.0
+    elif fever == "No":
+        fever_value = 0.0
+    else:
+        fever_value = np.nan
 
     input_df = pd.DataFrame([{
         "PCT": pct,
@@ -192,19 +262,75 @@ def build_input_dataframe(
         "IgA": iga
     }])
 
-    input_df = input_df[FEATURE_ORDER]
-
-    return input_df
+    return input_df[FEATURE_ORDER]
 
 
 def predict_probability(model, input_df):
-    dmatrix = xgb.DMatrix(input_df)
+    input_df = input_df.astype(float)
+    dmatrix = xgb.DMatrix(input_df, missing=np.nan)
     probability = float(model.predict(dmatrix)[0])
     return probability
+def calculate_shap_contributions(model, input_df):
+    """
+    Calculate individual-level SHAP contributions using XGBoost built-in pred_contribs.
+    SHAP values are on the model margin scale, usually log-odds for binary classification.
+    Positive values increase predicted infection risk; negative values decrease predicted infection risk.
+    """
+    input_df = input_df.astype(float)
+    dmatrix = xgb.DMatrix(input_df, missing=np.nan)
+
+    contribs = model.predict(dmatrix, pred_contribs=True)[0]
+
+    shap_values = contribs[:-1]
+    base_value = contribs[-1]
+
+    shap_df = pd.DataFrame({
+        "Feature": FEATURE_ORDER,
+        "Variable": [FEATURE_LABELS[x] for x in FEATURE_ORDER],
+        "Input Value": input_df.iloc[0].values,
+        "SHAP Value": shap_values
+    })
+
+    shap_df["Abs SHAP Value"] = shap_df["SHAP Value"].abs()
+    shap_df["Direction"] = np.where(
+        shap_df["SHAP Value"] > 0,
+        "Increases predicted infection risk",
+        "Decreases predicted infection risk"
+    )
+
+    shap_df["Input Value"] = shap_df["Input Value"].apply(format_value_for_display)
+    shap_df = shap_df.sort_values("Abs SHAP Value", ascending=False)
+
+    return shap_df, base_value
+
+
+def plot_individual_shap_bar(shap_df, top_n=10):
+    """
+    Plot top N SHAP contributions for one patient.
+    """
+    plot_df = shap_df.head(top_n).copy()
+    plot_df = plot_df.sort_values("SHAP Value", ascending=True)
+
+    colors = [
+        "#C62828" if v > 0 else "#2E7D32"
+        for v in plot_df["SHAP Value"]
+    ]
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.barh(plot_df["Variable"], plot_df["SHAP Value"], color=colors)
+    ax.axvline(0, color="gray", linewidth=0.8)
+    ax.set_xlabel("SHAP value")
+    ax.set_ylabel("")
+    ax.set_title("Top feature contributions for this patient")
+
+    plt.tight_layout()
+
+    return fig
+
 
 
 # ============================================================
-# 7. Streamlit 网页主体
+# 8. Streamlit page
 # ============================================================
 
 st.set_page_config(
@@ -228,10 +354,6 @@ except Exception as e:
     st.stop()
 
 
-# ============================================================
-# 8. 页面布局
-# ============================================================
-
 left_col, right_col = st.columns([1.15, 1.0])
 
 
@@ -245,168 +367,114 @@ with left_col:
         """
     )
 
+    st.info(
+        "If a variable is unavailable, enter 'missing' or '缺失'. "
+        "Do not enter 0 for missing values unless the true measured value is 0."
+    )
+
     col1, col2 = st.columns(2)
 
     with col1:
-        age = st.number_input(
-            FEATURE_LABELS["Age"],
-            min_value=0.0,
-            max_value=120.0,
-            value=50.0,
-            step=1.0,
-            format="%.1f"
+        age = parse_numeric_or_missing(
+            text_numeric_input(FEATURE_LABELS["Age"], default_value="50.0"),
+            FEATURE_LABELS["Age"]
         )
 
         fever = st.selectbox(
             FEATURE_LABELS["Fever.1"],
-            options=["No", "Yes"],
+            options=["No", "Yes", "Missing"],
             index=0
         )
 
-        pct = st.number_input(
-            FEATURE_LABELS["PCT"],
-            min_value=0.0,
-            value=0.05,
-            step=0.01,
-            format="%.2f"
+        pct = parse_numeric_or_missing(
+            text_numeric_input(FEATURE_LABELS["PCT"], default_value="0.1"),
+            FEATURE_LABELS["PCT"]
         )
 
-        crp = st.number_input(
-            FEATURE_LABELS["CRP"],
-            min_value=0.0,
-            value=6.0,
-            step=1.0,
-            format="%.2f"
+        crp = parse_numeric_or_missing(
+            text_numeric_input(FEATURE_LABELS["CRP"], default_value="6.0"),
+            FEATURE_LABELS["CRP"]
         )
 
-        wbc_hp = st.number_input(
-            FEATURE_LABELS["WBC.HP"],
-            min_value=0.0,
-            value=0.0,
-            step=1.0,
-            format="%.2f"
+        wbc_hp = parse_numeric_or_missing(
+            text_numeric_input(FEATURE_LABELS["WBC.HP"], default_value="0.0"),
+            FEATURE_LABELS["WBC.HP"]
         )
 
-        ly_percent = st.number_input(
-            FEATURE_LABELS["LY."],
-            min_value=0.0,
-            max_value=100.0,
-            value=20.0,
-            step=1.0,
-            format="%.2f"
+        ly_percent = parse_numeric_or_missing(
+            text_numeric_input(FEATURE_LABELS["LY."], default_value="20.0"),
+            FEATURE_LABELS["LY."]
         )
 
-        ldh = st.number_input(
-            FEATURE_LABELS["LDH"],
-            min_value=0.0,
-            value=200.0,
-            step=10.0,
-            format="%.2f"
+        ldh = parse_numeric_or_missing(
+            text_numeric_input(FEATURE_LABELS["LDH"], default_value="200.0"),
+            FEATURE_LABELS["LDH"]
         )
 
-        nlr = st.number_input(
-            FEATURE_LABELS["NLR"],
-            min_value=0.0,
-            value=3.0,
-            step=0.1,
-            format="%.2f"
+        nlr = parse_numeric_or_missing(
+            text_numeric_input(FEATURE_LABELS["NLR"], default_value="3.0"),
+            FEATURE_LABELS["NLR"]
         )
 
-        potassium = st.number_input(
-            FEATURE_LABELS["K"],
-            min_value=0.0,
-            value=4.0,
-            step=0.1,
-            format="%.2f"
+        potassium = parse_numeric_or_missing(
+            text_numeric_input(FEATURE_LABELS["K"], default_value="4.0"),
+            FEATURE_LABELS["K"]
         )
 
-        igg = st.number_input(
-            FEATURE_LABELS["IgG"],
-            min_value=0.0,
-            value=10.0,
-            step=0.1,
-            format="%.2f"
+        igg = parse_numeric_or_missing(
+            text_numeric_input(FEATURE_LABELS["IgG"], default_value="10.0"),
+            FEATURE_LABELS["IgG"]
         )
 
     with col2:
-        plr = st.number_input(
-            FEATURE_LABELS["PLR"],
-            min_value=0.0,
-            value=150.0,
-            step=1.0,
-            format="%.2f"
+        plr = parse_numeric_or_missing(
+            text_numeric_input(FEATURE_LABELS["PLR"], default_value="150.0"),
+            FEATURE_LABELS["PLR"]
         )
 
-        alb = st.number_input(
-            FEATURE_LABELS["Alb"],
-            min_value=0.0,
-            value=40.0,
-            step=1.0,
-            format="%.2f"
+        alb = parse_numeric_or_missing(
+            text_numeric_input(FEATURE_LABELS["Alb"], default_value="40.0"),
+            FEATURE_LABELS["Alb"]
         )
 
-        egfr = st.number_input(
-            FEATURE_LABELS["CKDEPI"],
-            min_value=0.0,
-            value=90.0,
-            step=1.0,
-            format="%.2f"
+        egfr = parse_numeric_or_missing(
+            text_numeric_input(FEATURE_LABELS["CKDEPI"], default_value="90.0"),
+            FEATURE_LABELS["CKDEPI"]
         )
 
-        ck = st.number_input(
-            FEATURE_LABELS["CK"],
-            min_value=0.0,
-            value=80.0,
-            step=10.0,
-            format="%.2f"
+        ck = parse_numeric_or_missing(
+            text_numeric_input(FEATURE_LABELS["CK"], default_value="80.0"),
+            FEATURE_LABELS["CK"]
         )
 
-        esr_crp = st.number_input(
-            FEATURE_LABELS["ESR.CRP"],
-            min_value=0.0,
-            value=2.0,
-            step=0.1,
-            format="%.2f"
+        esr_crp = parse_numeric_or_missing(
+            text_numeric_input(FEATURE_LABELS["ESR.CRP"], default_value="2.0"),
+            FEATURE_LABELS["ESR.CRP"]
         )
 
-        ddimer = st.number_input(
-            FEATURE_LABELS["DD"],
-            min_value=0.0,
-            value=0.5,
-            step=0.1,
-            format="%.2f"
+        ddimer = parse_numeric_or_missing(
+            text_numeric_input(FEATURE_LABELS["DD"], default_value="0.5"),
+            FEATURE_LABELS["DD"]
         )
 
-        sodium = st.number_input(
-            FEATURE_LABELS["Na"],
-            min_value=0.0,
-            value=140.0,
-            step=1.0,
-            format="%.2f"
+        sodium = parse_numeric_or_missing(
+            text_numeric_input(FEATURE_LABELS["Na"], default_value="140.0"),
+            FEATURE_LABELS["Na"]
         )
 
-        fibrinogen = st.number_input(
-            FEATURE_LABELS["Fg"],
-            min_value=0.0,
-            value=3.0,
-            step=0.1,
-            format="%.2f"
+        fibrinogen = parse_numeric_or_missing(
+            text_numeric_input(FEATURE_LABELS["Fg"], default_value="3.0"),
+            FEATURE_LABELS["Fg"]
         )
 
-        lymphocyte_count = st.number_input(
-            FEATURE_LABELS["LY"],
-            min_value=0.0,
-            value=1.2,
-            step=0.1,
-            format="%.2f"
+        lymphocyte_count = parse_numeric_or_missing(
+            text_numeric_input(FEATURE_LABELS["LY"], default_value="1.2"),
+            FEATURE_LABELS["LY"]
         )
 
-        iga = st.number_input(
-            FEATURE_LABELS["IgA"],
-            min_value=0.0,
-            value=2.0,
-            step=0.1,
-            format="%.2f"
+        iga = parse_numeric_or_missing(
+            text_numeric_input(FEATURE_LABELS["IgA"], default_value="2.0"),
+            FEATURE_LABELS["IgA"]
         )
 
     predict_button = st.button("Calculate Infection Risk", type="primary")
@@ -444,41 +512,92 @@ with right_col:
         explanation = generate_explanation(probability, risk_group)
         color = risk_color_style(risk_group)
 
-        st.markdown(
-            f"""
-            <div style="
-                padding: 24px;
-                border-radius: 14px;
-                border: 1px solid #E0E0E0;
-                background-color: #FAFAFA;
-            ">
-                <h2 style="margin-bottom: 4px;">Predicted Probability of Infection</h2>
-                <h1 style="color: {color}; font-size: 48px; margin-top: 0;">
-                    {probability * 100:.1f}%
-                </h1>
-                <h2 style="color: {color};">
-                    {risk_group_full}
-                </h2>
-                <p style="font-size: 16px; line-height: 1.6;">
-                    {explanation}
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+        with st.container(border=True):
+            result_col1, result_col2 = st.columns([1, 1.3])
+        with st.expander("Individual SHAP Explanation", expanded=False):
+         shap_df, base_value = calculate_shap_contributions(model, input_df)
 
-        st.markdown("### Input Variable Check")
+    st.markdown(
+        """
+        Positive SHAP values increase the predicted infection risk, whereas negative SHAP values decrease the predicted infection risk.  
+        The SHAP values are shown on the model output scale and should be interpreted as feature contributions rather than causal effects.
+        """
+    )
 
-        display_df = input_df.T.rename(columns={0: "Input Value"})
-        display_df.index = [FEATURE_LABELS[x] for x in display_df.index]
-        st.dataframe(display_df, use_container_width=True)
+    fig = plot_individual_shap_bar(shap_df, top_n=10)
+    st.pyplot(fig)
+
+    st.markdown("#### SHAP Contribution Table")
+    st.dataframe(
+        shap_df[
+            [
+                "Variable",
+                "Input Value",
+                "SHAP Value",
+                "Direction"
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True
+    )
+
+    with result_col1:
+                st.caption("Predicted Probability of Infection")
+                st.markdown(
+                    f"""
+                    <div style="
+                        color: {color};
+                        font-size: 42px;
+                        font-weight: 700;
+                        line-height: 1.2;
+                        margin-top: -8px;
+                    ">
+                        {probability * 100:.1f}%
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+    with result_col2:
+                st.caption("Risk Group")
+                st.markdown(
+                    f"""
+                    <div style="
+                        color: {color};
+                        font-size: 28px;
+                        font-weight: 700;
+                        line-height: 1.3;
+                        margin-top: -4px;
+                    ">
+                        {risk_group_full}
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+    with st.expander("Interpretation", expanded=False):
+           st.write(explanation)
+
+    missing_count = int(input_df.isna().sum().sum())
+    if missing_count > 0:
+            st.warning(
+                f"{missing_count} missing value(s) were entered. "
+                "The prediction was generated using XGBoost's built-in missing-value handling. "
+                "Please interpret the result with caution."
+            )
+
+            with st.expander("Input Variable Check", expanded=False):
+             display_df = input_df.T.rename(columns={0: "Input Value"})
+             display_df.index = [FEATURE_LABELS[x] for x in display_df.index]
+             display_df["Input Value"] = display_df["Input Value"].apply(format_value_for_display)
+
+            st.dataframe(display_df, use_container_width=True)
 
     else:
         st.info("Please enter the patient's variables and click 'Calculate Infection Risk'.")
 
 
 # ============================================================
-# 9. 模型说明
+# 9. Model information
 # ============================================================
 
 st.markdown("---")
@@ -493,13 +612,14 @@ with st.expander("Model Information and Risk Stratification Thresholds", expande
         - **Intermediate-risk group**: **{T1_LOW_TO_INTERMEDIATE:.4f} ≤ predicted probability < {T2_INTERMEDIATE_TO_HIGH:.4f}**
         - **High-risk group**: predicted probability ≥ **{T2_INTERMEDIATE_TO_HIGH:.4f}**
 
+        Missing values are passed to the XGBoost model as `NaN`.  
         This tool is intended for clinical decision support and should not replace physician judgment.
         """
     )
 
 
 # ============================================================
-# 10. 批量预测功能，可选
+# 10. Optional batch prediction
 # ============================================================
 
 st.markdown("---")
@@ -535,16 +655,36 @@ if uploaded_file is not None:
             )
         else:
             batch_input = batch_df[FEATURE_ORDER].copy()
-            batch_dmatrix = xgb.DMatrix(batch_input)
+
+            for col in FEATURE_ORDER:
+                batch_input[col] = batch_input[col].replace(list(MISSING_TOKENS), np.nan)
+
+            # Support Yes/No/Missing text values for Fever.1 in batch files
+            if "Fever.1" in batch_input.columns:
+                batch_input["Fever.1"] = batch_input["Fever.1"].replace({
+                    "Yes": 1,
+                    "yes": 1,
+                    "Y": 1,
+                    "y": 1,
+                    "No": 0,
+                    "no": 0,
+                    "N": 0,
+                    "n": 0,
+                    "Missing": np.nan,
+                    "missing": np.nan,
+                    "缺失": np.nan
+                })
+
+            for col in FEATURE_ORDER:
+                batch_input[col] = pd.to_numeric(batch_input[col], errors="coerce")
+
+            batch_dmatrix = xgb.DMatrix(batch_input.astype(float), missing=np.nan)
             batch_prob = model.predict(batch_dmatrix)
 
             result_df = batch_df.copy()
-            result_df["Predicted_Probability"] = batch_prob
-            result_df["Predicted_Probability_Percent"] = batch_prob * 100
-
-            result_df["Risk_Group"] = [
-                classify_risk(float(p))[1] for p in batch_prob
-            ]
+            result_df["Predicted_Probability"] = np.round(batch_prob, 3)
+            result_df["Predicted_Probability_Percent"] = np.round(batch_prob * 100, 1)
+            result_df["Risk_Group"] = [classify_risk(float(p))[1] for p in batch_prob]
 
             st.success("Batch prediction completed.")
             st.dataframe(result_df, use_container_width=True)
