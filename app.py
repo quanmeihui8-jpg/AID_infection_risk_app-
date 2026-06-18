@@ -6,6 +6,7 @@ import numpy as np
 import xgboost as xgb
 import matplotlib.pyplot as plt
 
+
 # ============================================================
 # 1. Model path and risk thresholds
 # ============================================================
@@ -207,7 +208,7 @@ def risk_color_style(risk_group: str):
 
 
 # ============================================================
-# 7. Build input data and predict
+# 7. Build input data, predict, and calculate SHAP
 # ============================================================
 
 def build_input_dataframe(
@@ -270,6 +271,8 @@ def predict_probability(model, input_df):
     dmatrix = xgb.DMatrix(input_df, missing=np.nan)
     probability = float(model.predict(dmatrix)[0])
     return probability
+
+
 def calculate_shap_contributions(model, input_df):
     """
     Calculate individual-level SHAP contributions using XGBoost built-in pred_contribs.
@@ -304,7 +307,7 @@ def calculate_shap_contributions(model, input_df):
     return shap_df, base_value
 
 
-def plot_individual_shap_bar(shap_df, top_n=10):
+def plot_individual_shap_bar(shap_df, top_n=8):
     """
     Plot top N SHAP contributions for one patient.
     """
@@ -312,21 +315,31 @@ def plot_individual_shap_bar(shap_df, top_n=10):
     plot_df = plot_df.sort_values("SHAP Value", ascending=True)
 
     colors = [
-        "#C62828" if v > 0 else "#2E7D32"
+        "#E74C3C" if v > 0 else "#2ECC71"
         for v in plot_df["SHAP Value"]
     ]
 
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.barh(plot_df["Variable"], plot_df["SHAP Value"], color=colors)
-    ax.axvline(0, color="gray", linewidth=0.8)
-    ax.set_xlabel("SHAP value")
+    fig, ax = plt.subplots(figsize=(5.8, 3.4))
+    fig.patch.set_facecolor("#0E1117")
+    ax.set_facecolor("#0E1117")
+
+    ax.barh(plot_df["Variable"], plot_df["SHAP Value"], color=colors, height=0.55)
+    ax.axvline(0, color="gray", linewidth=0.8, alpha=0.8)
+
+    ax.set_title("Top feature contributions", color="white", fontsize=11, pad=8)
+    ax.set_xlabel("SHAP value", color="white", fontsize=9)
     ax.set_ylabel("")
-    ax.set_title("Top feature contributions for this patient")
+
+    ax.tick_params(axis="x", colors="white", labelsize=8)
+    ax.tick_params(axis="y", colors="white", labelsize=8)
+
+    for spine in ax.spines.values():
+        spine.set_color("#666666")
+
+    ax.grid(axis="x", linestyle="--", alpha=0.12, color="white")
 
     plt.tight_layout()
-
     return fig
-
 
 
 # ============================================================
@@ -514,34 +527,8 @@ with right_col:
 
         with st.container(border=True):
             result_col1, result_col2 = st.columns([1, 1.3])
-        with st.expander("Individual SHAP Explanation", expanded=False):
-         shap_df, base_value = calculate_shap_contributions(model, input_df)
 
-    st.markdown(
-        """
-        Positive SHAP values increase the predicted infection risk, whereas negative SHAP values decrease the predicted infection risk.  
-        The SHAP values are shown on the model output scale and should be interpreted as feature contributions rather than causal effects.
-        """
-    )
-
-    fig = plot_individual_shap_bar(shap_df, top_n=10)
-    st.pyplot(fig)
-
-    st.markdown("#### SHAP Contribution Table")
-    st.dataframe(
-        shap_df[
-            [
-                "Variable",
-                "Input Value",
-                "SHAP Value",
-                "Direction"
-            ]
-        ],
-        use_container_width=True,
-        hide_index=True
-    )
-
-    with result_col1:
+            with result_col1:
                 st.caption("Predicted Probability of Infection")
                 st.markdown(
                     f"""
@@ -558,7 +545,7 @@ with right_col:
                     unsafe_allow_html=True
                 )
 
-    with result_col2:
+            with result_col2:
                 st.caption("Risk Group")
                 st.markdown(
                     f"""
@@ -574,21 +561,49 @@ with right_col:
                     """,
                     unsafe_allow_html=True
                 )
-    with st.expander("Interpretation", expanded=False):
-           st.write(explanation)
 
-    missing_count = int(input_df.isna().sum().sum())
-    if missing_count > 0:
+        with st.expander("Interpretation", expanded=False):
+            st.write(explanation)
+
+        with st.expander("Individual SHAP Explanation", expanded=False):
+            shap_df, base_value = calculate_shap_contributions(model, input_df)
+
+            st.markdown(
+                """
+                Positive SHAP values increase the predicted infection risk, whereas negative SHAP values decrease the predicted infection risk.  
+                SHAP values reflect each feature's contribution to the individual prediction and should not be interpreted as causal effects.
+                """
+            )
+
+            fig = plot_individual_shap_bar(shap_df, top_n=8)
+            st.pyplot(fig, clear_figure=True)
+
+            st.markdown("#### SHAP Contribution Table")
+            st.dataframe(
+                shap_df[
+                    [
+                        "Variable",
+                        "Input Value",
+                        "SHAP Value",
+                        "Direction"
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True
+            )
+
+        missing_count = int(input_df.isna().sum().sum())
+        if missing_count > 0:
             st.warning(
                 f"{missing_count} missing value(s) were entered. "
                 "The prediction was generated using XGBoost's built-in missing-value handling. "
                 "Please interpret the result with caution."
             )
 
-            with st.expander("Input Variable Check", expanded=False):
-             display_df = input_df.T.rename(columns={0: "Input Value"})
-             display_df.index = [FEATURE_LABELS[x] for x in display_df.index]
-             display_df["Input Value"] = display_df["Input Value"].apply(format_value_for_display)
+        with st.expander("Input Variable Check", expanded=False):
+            display_df = input_df.T.rename(columns={0: "Input Value"})
+            display_df.index = [FEATURE_LABELS[x] for x in display_df.index]
+            display_df["Input Value"] = display_df["Input Value"].apply(format_value_for_display)
 
             st.dataframe(display_df, use_container_width=True)
 
@@ -613,6 +628,7 @@ with st.expander("Model Information and Risk Stratification Thresholds", expande
         - **High-risk group**: predicted probability ≥ **{T2_INTERMEDIATE_TO_HIGH:.4f}**
 
         Missing values are passed to the XGBoost model as `NaN`.  
+        SHAP values are used to provide individual-level interpretation of model predictions.  
         This tool is intended for clinical decision support and should not replace physician judgment.
         """
     )
